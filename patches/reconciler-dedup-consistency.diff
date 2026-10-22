@@ -1,0 +1,58 @@
+# Upstream source: Tencent-Hunyuan/Hy-Memory, hy-memory 2.0.3
+# Upstream copyright: Copyright (C) 2026 Tencent. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by the hy-memory-mcp project; these are local modifications.
+# Modification details are documented below and in NOTICE.
+# Upstream license copy: third_party/HY-MEMORY-LICENSE
+
+# T001: reconciler: DEDUP 只移除确认隐藏的候选（计划数 != 已隐藏）
+# 基线 = pip 原版 + apply_patches.py 的片段补丁（顺序不能变）
+# sha256-before: 9b5678a00380ec76eef0d99ceec38fabcf3df51455899d692f08e55f9a77468d
+# sha256-after:  dbe0e03d624c8f5f5d7d60ce6455083fef860d54fb2de273c6f5e0c9a1f564dd
+--- a/agent/reconciler.py
++++ b/agent/reconciler.py
+@@ -618,7 +618,14 @@
+     FINAL_TOPK = 10
+     # max_tokens for reconcile LLM call（基础值 + 动态扩展）
+     # 每条 ADD 输出大约 200-300 tokens（content + supersedes + reason）
+-    # 总上限 8000 tokens，防止单次调用失控
++    # 总上限 16000 tokens，防止单次调用失控
++    #
++    # [本地修改 2026-10-19] 基础值 2000 → 8000，上限 8000 → 16000。
++    # 原因：step-5-preview 是推理模型，思维链与正式输出共用 max_tokens 预算。
++    # 实测 22 次 RECONCILE 里 10 次 completion_tokens 精确等于 2000 且 content
++    # 为空（parsed 只有 "[]"），即思维链吃光配额、一条 op 都没产出。关思考的
++    # 参数（reasoning_effort=none / thinking.disabled / enable_thinking=false）
++    # 在本网关上全部静默失效，只能抬高上限。
+     MAX_TOKENS = 8000
+     PER_OP_TOKENS = 300
+     BASE_OVERHEAD_TOKENS = 1500
+@@ -1171,8 +1178,26 @@
+                                 "batch_size": len(_batch["items"]),
+                             },
+                         )
+-                        for did in plan.get("delete_ids", []):
+-                            candidate_map.pop(did, None)
++                        # 计划 ≠ 已隐藏：只移除**确认隐藏**的候选。execute_dedup 的
++                        # delete_ids 是计划项；apply.confirmed_ids 才是拿到回执的部分。
++                        # 失败/未知/未确认的候选必须留在 candidate_map 里 —— 它们仍然
++                        # 可被检索到，如果在这里被当成"已处理"移出，后续对同一事实会
++                        # 走全 ADD 兜底，产生重复写入或丢失比较基线。
++                        _apply = plan.get("apply") or {}
++                        _confirmed = list(_apply.get("confirmed_ids") or [])
++                        _hidden = 0
++                        for did in _confirmed:
++                            if candidate_map.pop(did, None) is not None:
++                                _hidden += 1
++                        _planned = _apply.get("planned", len(plan.get("delete_ids", [])))
++                        if _planned > _hidden:
++                            logger.warning(
++                                f"[reconciler] dedup planned={_planned} "
++                                f"confirmed_hidden={_hidden} "
++                                f"failed={_apply.get('failed')} "
++                                f"applied={_apply.get('applied')}; "
++                                f"unconfirmed candidates kept in candidate_map"
++                            )
+             except Exception as e:
+                 logger.warning(f"[reconciler] candidate dedup failed: {e}")
+ 

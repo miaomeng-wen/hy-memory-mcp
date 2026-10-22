@@ -1,0 +1,10 @@
+# Direct dependencies matching the source installation used for offline checks.
+# SDK patches are tied to this exact hy-memory version.
+hy-memory==2.0.3
+mcp==2.3.0
+httpx==0.28.1
+httpx2==2.13.1
+python-dotenv==1.2.4
+fastapi==0.146.0
+uvicorn==0.54.0
+python-multipart==0.0.32

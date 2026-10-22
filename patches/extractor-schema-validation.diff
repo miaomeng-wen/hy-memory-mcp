@@ -1,0 +1,215 @@
+# Upstream source: Tencent-Hunyuan/Hy-Memory, hy-memory 2.0.3
+# Upstream copyright: Copyright (C) 2026 Tencent. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by the hy-memory-mcp project; these are local modifications.
+# Modification details are documented below and in NOTICE.
+# Upstream license copy: third_party/HY-MEMORY-LICENSE
+
+# T001: extractor: EXTRACT 结构校验（{} / 未知字段 / 错误类型不得当成功空结果）
+# 基线 = pip 原版 + apply_patches.py 的片段补丁（顺序不能变）
+# sha256-before: 40260d3f8ce9bef99d8d538342b79998c0f699f2e4d9f6b9c913675c73615504
+# sha256-after:  0f4e6f10c23d9089afdb7420672f121925312d781b7bf34bc63a4f2d5ec457a3
+--- a/agent/extractor.py
++++ b/agent/extractor.py
+@@ -11,7 +11,7 @@
+ 另保留 deep_extract (System 2 深度分析) 供后台精炼使用。
+ """
+ 
+-from typing import Dict, Any, Optional, List
++from typing import Dict, Any, Optional, List, Tuple
+ from dataclasses import dataclass, field
+ from enum import Enum
+ import json
+@@ -93,7 +93,7 @@
+     completion_tokens: int = 0
+     error: Optional[str] = None
+     error_code: Optional[str] = (
+-        None  # "EMPTY_RESPONSE" / "JSON_PARSE_FAILED" / "LLM_ERROR"
++        None  # "EMPTY_RESPONSE" / "JSON_PARSE_FAILED" / "INVALID_STRUCTURE" / "LLM_ERROR"
+     )
+     raw_response: Optional[str] = (
+         None  # LLM 原始返回（失败时保留，用于写 pipeline_log）
+@@ -109,6 +109,9 @@
+     llm_reasoning_tokens: int = 0
+     llm_reasoning_len: int = 0
+     tool_calls_only: bool = False  # True 当 LLM 只返回了 tool_calls，content 为空
++    # True 当 finish_reason=length（输出被截断）且 JSON 依赖 json_repair 才修好：
++    # 结构可以接受，但内容可能缺少被截断的后半段事实，调用方需按"部分结果"看待。
++    truncated_repaired: bool = False
+     attempts: List[Dict[str, Any]] = field(
+         default_factory=list
+     )  # LLM 重试各次失败明细（来自 LLMRetryError.attempts），写入 EXTRACT trace
+@@ -1304,8 +1307,9 @@
+ 
+             # 解析 JSON
+             info: Dict[str, Any]
++            _parse_mode = "strict"
+             if raw_text and raw_text.strip():
+-                parsed = self._parse_json(raw_text)
++                parsed, _parse_mode = self._parse_json_with_mode(raw_text)
+                 if parsed is None:
+                     if not all_tool_calls:
+                         logger.warning(
+@@ -1340,6 +1344,42 @@
+             if all_tool_results:
+                 info["tool_results"] = all_tool_results
+ 
++            # 结构校验：能解析成 JSON 不等于给出了合法抽取结果。
++            # 空对象、未知字段、错误类型过去一律 success=True，writer 据此把
++            # 原始对话降级（L1_RAW → SHADOW），等于用一次结构事故隐藏了原文。
++            # 这里只放行「显式合法结构」（含显式空结果 [];{}），其余判失败并
++            # 带上 error_code，让 writer 走既有的失败路径保留 L1。
++            if not all_tool_calls:
++                _schema_error = self._validate_extract_schema(info)
++                if _schema_error:
++                    logger.warning(
++                        "[extractor] extract result failed schema check: %s "
++                        "finish_reason=%r content_len=%d keys=%s",
++                        _schema_error,
++                        llm_finish_reason,
++                        llm_content_len,
++                        sorted(info.keys())[:8],
++                    )
++                    return ExtractResult(
++                        success=False,
++                        error=f"extract result has no valid structure: {_schema_error}",
++                        error_code="INVALID_STRUCTURE",
++                        raw_response=raw_text,
++                        tokens_used=total_tokens,
++                        prompt_tokens=total_prompt_tokens,
++                        completion_tokens=total_completion_tokens,
++                        llm_finish_reason=llm_finish_reason,
++                        llm_model=llm_model,
++                        llm_response_id=llm_response_id,
++                        llm_choices_count=llm_choices_count,
++                        llm_content_len=llm_content_len,
++                        llm_tool_calls_count=llm_tool_calls_count,
++                        llm_reasoning_tokens=llm_reasoning_tokens,
++                        llm_reasoning_len=llm_reasoning_len,
++                        _actual_prompt=_actual_user_prompt,
++                        _actual_system_prompt=_actual_sys_prompt,
++                    )
++
+             # One extraction call covers one current write and cannot establish
+             # repetition across independent occurrences. Keep any bounded
+             # Episode, but defer Series creation to reconcile where historical
+@@ -1414,6 +1454,18 @@
+                 and not info.get("identity")  # legacy compat
+             )
+ 
++            # finish_reason=length 且 JSON 只有靠 json_repair 才修复成功，说明模型
++            # 输出被截断，修出来的结构可能正好丢掉了后半段事实。此时记录诊断字段，
++            # 上层可据此判断结果是否完整。
++            _truncated_repaired = llm_finish_reason == "length" and _parse_mode == "repaired"
++            if _truncated_repaired:
++                logger.warning(
++                    "[extractor] output truncated (finish_reason=length) and JSON "
++                    "recovered by json_repair; structured result may be partial "
++                    "content_len=%d",
++                    llm_content_len,
++                )
++
+             result = ExtractResult(
+                 success=True,
+                 info=info,
+@@ -1429,6 +1481,7 @@
+                 llm_content_len=llm_content_len,
+                 llm_tool_calls_count=llm_tool_calls_count,
+                 tool_calls_only=tool_calls_only,
++                truncated_repaired=_truncated_repaired,
+                 _actual_prompt=_actual_user_prompt,
+                 _actual_system_prompt=_actual_sys_prompt,
+             )
+@@ -1484,6 +1537,16 @@
+ 
+     def _parse_json(self, text: str) -> Optional[Dict[str, Any]]:
+         """从 LLM 输出中解析 JSON。成功返回 dict，解析失败返回 None。"""
++        parsed, _mode = self._parse_json_with_mode(text)
++        return parsed
++
++    def _parse_json_with_mode(self, text: str) -> Tuple[Optional[Dict[str, Any]], str]:
++        """解析 JSON，并说明结果来自严格解析还是 json_repair 修复。
++
++        返回 ``(dict, mode)``，mode 为 ``"strict"``（原始输出即合法 JSON）、
++        ``"repaired"``（依赖 json_repair 补齐）或 ``""``（解析失败）。
++        mode 用于判断 finish_reason=length 时结果是否可能被截断。
++        """
+         text = text.strip()
+         # 处理 markdown 代码块
+         if "```json" in text:
+@@ -1492,13 +1555,13 @@
+             text = text.split("```")[1].split("```")[0].strip()
+ 
+         try:
+-            return json.loads(text)
++            return json.loads(text), "strict"
+         except json.JSONDecodeError:
+             # 尝试找到 JSON 块
+             match = re.search(r"\{[\s\S]*\}", text)
+             if match:
+                 try:
+-                    return json.loads(match.group())
++                    return json.loads(match.group()), "strict"
+                 except json.JSONDecodeError:
+                     pass
+         # 最后兜底：json_repair 修复常见 LLM 残缺输出（缺逗号/引号/未闭合等）
+@@ -1508,10 +1571,57 @@
+             repaired = repair_json(text, return_objects=True)
+             if isinstance(repaired, dict) and repaired:
+                 logger.info("[extractor] JSON recovered via json_repair")
+-                return repaired
++                return repaired, "repaired"
+         except Exception as _re:
+             logger.debug(f"[extractor] json_repair failed: {_re}")
+-        return None
++        return None, ""
++
++    # 抽取结果里允许出现的顶层键。前四项是主流 schema（memory/facts 同构，
++    # identity/profile/entities 为旧版兼容字段，writer 仍在消费），
++    # basic_info 承载画像，tool_calls/tool_results 由工具调用链路注入。
++    _EXTRACT_LIST_KEYS = ("memory", "facts", "identity", "intentions", "entities")
++    _EXTRACT_DICT_KEYS = ("basic_info", "profile")
++    _EXTRACT_REQUIRED_KEYS = ("memory", "facts", "identity", "intentions", "basic_info")
++
++    def _validate_extract_schema(self, info: Any) -> str:
++        """校验抽取结果的结构，返回空串表示合法，否则返回原因。
++
++        合法的抽取结果必须满足：至少出现一个 schema 键（memory / facts /
++        identity / intentions / basic_info），已知键的类型符合 schema，
++        列表项是带 content 的 dict。**显式空结果**（如 ``{"memory": []}``
++        或 ``{"memory": [], "basic_info": {}}``）是模型给出的"本轮无事实"
++        结论，仍然合法——它与"模型什么都没给出/给错了"必须区分开。
++        """
++        if not isinstance(info, dict):
++            return f"result is {type(info).__name__}, expected object"
++        if not info:
++            return "empty object"
++        present = [k for k in self._EXTRACT_REQUIRED_KEYS if k in info]
++        if not present:
++            return (
++                "no known schema key (memory/facts/identity/intentions/basic_info); "
++                f"got {sorted(str(k) for k in info.keys())[:8]}"
++            )
++        for key in self._EXTRACT_LIST_KEYS:
++            if key not in info:
++                continue
++            value = info[key]
++            if value is None:
++                continue  # 显式 null 等同于该桶为空，由上层按"无该项"处理
++            if not isinstance(value, list):
++                return f"{key!r} must be a list, got {type(value).__name__}"
++            for idx, item in enumerate(value):
++                if not isinstance(item, dict):
++                    return f"{key}[{idx}] must be an object, got {type(item).__name__}"
++                if not str(item.get("content") or "").strip():
++                    return f"{key}[{idx}] has no content"
++        for key in self._EXTRACT_DICT_KEYS:
++            if key not in info:
++                continue
++            value = info[key]
++            if value is not None and not isinstance(value, dict):
++                return f"{key!r} must be an object, got {type(value).__name__}"
++        return ""
+ 
+     def get_stats(self) -> Dict[str, Any]:
+         """获取统计信息"""

@@ -1,0 +1,34 @@
+# Local credentials and generated configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# Private memories, logs, import progress, and local experiments
+data/
+logs/
+backups/
+work/
+t001v2/
+acl-recovery/
+*.db
+*.db-*
+*.sqlite*
+*.log
+*.bak
+*.tmp
+# Python environments and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+# Editor and OS state
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

@@ -1,0 +1,265 @@
+# Upstream source: Tencent-Hunyuan/Hy-Memory, hy-memory 2.0.3
+# Upstream copyright: Copyright (C) 2026 Tencent. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by the hy-memory-mcp project; these are local modifications.
+# Modification details are documented below and in NOTICE.
+# Upstream license copy: third_party/HY-MEMORY-LICENSE
+
+# T001: dedup: 计划/确认/失败分账，返回 apply 账本，按 update_payload 回执计数
+# 基线 = pip 原版 + apply_patches.py 的片段补丁（顺序不能变）
+# sha256-before: e38b7bc5ac507065f78603040ead67028373d4145a51d46fc17d319bf838679e
+# sha256-after:  e92121196934fc692c228c94e27f8ae6aba10166fc527328af5dadc918fcd9cf
+--- a/pipelines/_retrieval/dedup.py
++++ b/pipelines/_retrieval/dedup.py
+@@ -341,8 +341,17 @@
+     lines = [
+         f"[DEDUP] trigger={trigger} threshold={thr}",
+         f"compared_count={compared} max_cosine={_fmt(max_c)} avg_cosine={_fmt(avg_c)}",
+-        f"deleted_count={len(delete_ids)}",
+     ]
++    _apply = plan.get("apply") or {}
++    if _apply:
++        # 计划数 ≠ 已隐藏数：两行分开写，读日志的人不会再把计划当成功。
++        lines.append(f"planned_count={len(delete_ids)}")
++        lines.append(
++            f"confirmed_hidden={_apply.get('confirmed', 0)} "
++            f"failed={_apply.get('failed', 0)} applied={_apply.get('applied')}"
++        )
++    else:
++        lines.append(f"deleted_count={len(delete_ids)}")
+ 
+     groups = plan.get("groups", [])
+     if groups:
+@@ -386,11 +395,17 @@
+     if cache is None or not getattr(cache, "store_pipeline_log", None):
+         return
+     try:
++        _apply = plan.get("apply") or {}
++        _planned = len(plan.get("delete_ids", []))
++        # deleted_count 历史上被读成"删了多少"。执行账本存在时只报**确认**隐藏数，
++        # 避免把计划数当成功数；planned_count 单独保留计划数。
++        _deleted = _apply.get("confirmed", _planned) if _apply else _planned
+         parsed = {
+             "trigger": trigger,
+             "threshold": plan.get("threshold"),
+             "groups": plan.get("groups", []),
+-            "deleted_count": len(plan.get("delete_ids", [])),
++            "deleted_count": _deleted,
++            "planned_count": _planned,
+             "kept_count": len(plan.get("kept_ids", [])),
+             "compared_count": plan.get("compared_count", 0),
+             "max_cosine": plan.get("max_cosine"),
+@@ -406,7 +421,9 @@
+             prompt="",
+             response=_build_dedup_content(trigger, plan),
+             parsed=json.dumps(parsed, ensure_ascii=False, default=str),
+-            memory_ids=plan.get("delete_ids", []) or None,
++            # memory_ids 只放**已确认**隐藏的 id；计划项另见 parsed.planned_count。
++            memory_ids=(_apply.get("confirmed_ids") if _apply else plan.get("delete_ids"))
++            or None,
+         )
+     except Exception as e:
+         logger.debug(f"[dedup] emit DEDUP log failed: {e}")
+@@ -418,7 +435,7 @@
+     *,
+     kept_id: str,
+     trigger: str,
+-) -> int:
++) -> Dict[str, Any]:
+     """把重复节点置 SHADOW（逻辑删除），而不是硬删。
+ 
+     此前走 `vector_store.delete(nid)` 真删、不可恢复 —— 而被删的可能是一整条
+@@ -431,13 +448,23 @@
+ 
+     用 update_payload 而非 upsert：只改状态位，不重写向量（DedupItem 手里只有
+     embedding，没有完整节点；整节点 upsert 会破坏 payload）。
++
++    Returns:
++        {"attempted", "confirmed", "failed", "confirmed_ids", "failed_ids", "errors"}。
++        调用方必须用 confirmed 而不是 attempted 当作"已隐藏"的数量。
+     """
+     from ...models.memory import MemoryStatus
+ 
+-    ok = 0
++    confirmed_ids: List[str] = []
++    failed_ids: List[str] = []
++    errors: List[str] = []
+     for nid in node_ids:
+         try:
+-            await vector_store.update_payload(
++            # update_payload 的契约是返回 bool（VectorStoreBase.update_payload ->
++            # bool；Qdrant/Chroma 内部吞异常后 return False，Faiss 找不到点也返回
++            # False）。只看"没抛异常"会把 return False 当成已隐藏 —— 这正是
++            # "计划数冒充成功数"的另一半，必须显式判返回值。
++            ok = await vector_store.update_payload(
+                 nid,
+                 {
+                     "is_latest": False,
+@@ -447,10 +474,30 @@
+                     "dedup_kept_id": kept_id,
+                 },
+             )
+-            ok += 1
+         except Exception as e:
++            failed_ids.append(nid)
++            errors.append(f"{nid}: {e}")
+             logger.warning(f"[dedup] shadow {nid} failed (trigger={trigger}): {e}")
+-    return ok
++            continue
++        # 显式 False → 确定未生效；None/真值 → 视为 store 接受了这次更新
++        # （部分 store 实现不返回 bool，不能因此把成功误判成失败）。
++        if ok is False:
++            failed_ids.append(nid)
++            errors.append(f"{nid}: update_payload returned False")
++            logger.warning(
++                f"[dedup] shadow {nid} not confirmed (trigger={trigger}): "
++                f"update_payload returned False"
++            )
++            continue
++        confirmed_ids.append(nid)
++    return {
++        "attempted": len(node_ids),
++        "confirmed": len(confirmed_ids),
++        "failed": len(failed_ids),
++        "confirmed_ids": confirmed_ids,
++        "failed_ids": failed_ids,
++        "errors": errors,
++    }
+ 
+ 
+ async def execute_dedup(
+@@ -478,18 +525,42 @@
+         extra_parsed: 额外写入 DEDUP log.parsed 的字段（如 embed 耗时 / provider meta）。
+ 
+     Returns:
+-        plan dict（含 delete_ids / kept_ids / groups）。无重复时 delete_ids 为空。
++        plan dict（含 delete_ids / kept_ids / groups），外加 ``apply`` 执行账本：
++        ``{"planned", "attempted", "confirmed", "failed", "confirmed_ids",
++        "failed_ids", "errors", "applied", "apply_mode"}``。
++        ``delete_ids`` 是**计划**隐藏的 id；只有 ``apply.confirmed_ids`` 是已确认
++        隐藏的 id。调用方不得用 ``delete_ids`` 当作"已处理"的凭据。
++        ``apply.applied`` 取值：True（全部确认）/ "partial" / "failed" /
++        "unknown"（要求隐藏但无 store）/ "planned_only"（extractor 阶段，未入库，
++        只规划 drop）/ "noop"（比较后无重复，无事可做）。
+     """
+     try:
+         plan = plan_dedup(items, threshold=threshold)
+     except Exception as e:
+         logger.warning(f"[dedup] plan_dedup failed (trigger={trigger}): {e}")
+-        return {"threshold": threshold, "groups": [], "delete_ids": [], "kept_ids": []}
++        plan = {"threshold": threshold, "groups": [], "delete_ids": [], "kept_ids": []}
++        plan["apply"] = {
++            "planned": 0, "attempted": 0, "confirmed": 0, "failed": 0,
++            "confirmed_ids": [], "failed_ids": [], "errors": [f"plan_dedup failed: {e}"],
++            # 规划阶段就炸了：既没有计划项也没有确认项，语义是"未知/失败"，
++            # 不能记成 noop（noop 表示"比较过且确实无重复"）。
++            "applied": "failed",
++            "apply_mode": "planned_only",
++        }
++        return plan
+ 
+     delete_ids = plan.get("delete_ids", [])
+     if not delete_ids:
+         # 无重复：仍落一条 DEDUP step（记录 compared_count / max_cosine / avg_cosine），
+         # 方便确认 dedup 确实跑过、最接近的一对离阈值有多远。
++        plan["apply"] = {
++            "planned": 0, "attempted": 0, "confirmed": 0, "failed": 0,
++            "confirmed_ids": [], "failed_ids": [], "errors": [],
++            # 比较过、确实没有重复 → 合法的"无事可做"。
++            "applied": "noop",
++            "apply_mode": "shadow" if (delete_from_store and vector_store is not None)
++            else "planned_only",
++        }
+         await _emit_dedup_log(
+             cache,
+             request_id=request_id,
+@@ -501,9 +572,24 @@
+         )
+         return plan
+ 
++    # ── 执行结果如实记账：计划 ≠ 已隐藏 ──
++    apply_stats: Dict[str, Any] = {
++        "planned": len(delete_ids),
++        "attempted": 0,
++        "confirmed": 0,
++        "failed": 0,
++        "confirmed_ids": [],
++        "failed_ids": [],
++        "errors": [],
++        # applied: True=已按计划隐藏  False=未执行任何存储操作（planned_only）
++        #          "partial"/"failed"=真实执行但未全部确认
++        "applied": False,
++        "apply_mode": "planned_only",
++    }
+     if delete_from_store and vector_store is not None:
++        apply_stats["apply_mode"] = "shadow"
+         # 逻辑删除（SHADOW），不硬删。每个组的 kept_id 单独记，便于事后追溯
+-        # "这条被哪条取代"。
++        # "这条被哪条取代"。逐组执行，按真实回执累计，不能把计划数当成功数。
+         for g in plan.get("groups", []):
+             _kept = (g.get("kept") or {}).get("node_id", "")
+             _gids: List[str] = []
+@@ -512,9 +598,33 @@
+                     _gids.append(d["node_id"])
+                 _gids.extend(d.get("also_deleted_chain") or [])
+             if _gids:
+-                await _shadow_nodes(
++                _res = await _shadow_nodes(
+                     vector_store, _gids, kept_id=_kept, trigger=trigger,
+                 )
++                apply_stats["attempted"] += _res["attempted"]
++                apply_stats["confirmed"] += _res["confirmed"]
++                apply_stats["failed"] += _res["failed"]
++                apply_stats["confirmed_ids"].extend(_res["confirmed_ids"])
++                apply_stats["failed_ids"].extend(_res["failed_ids"])
++                apply_stats["errors"].extend(_res["errors"])
++        if apply_stats["confirmed"] == apply_stats["attempted"] > 0:
++            apply_stats["applied"] = True
++        elif apply_stats["confirmed"] == 0:
++            apply_stats["applied"] = "failed"
++        else:
++            apply_stats["applied"] = "partial"
++    elif delete_from_store:
++        # 调用方要求隐藏但没有 store：不能记成已隐藏。
++        apply_stats["applied"] = "unknown"
++        apply_stats["errors"].append("vector_store is None; shadow not executed")
++    else:
++        # extractor 阶段：结果尚未入库，delete_from_store=False。这里只是"规划丢弃"，
++        # 不是存储操作 —— 明确标注，避免被读成"已隐藏 N 条"。
++        apply_stats["applied"] = "planned_only"
++
++    _emit_parsed = dict(extra_parsed or {})
++    _emit_parsed["dedup_apply"] = apply_stats
++    plan["apply"] = apply_stats
+ 
+     await _emit_dedup_log(
+         cache,
+@@ -523,11 +633,23 @@
+         agent_id=agent_id,
+         trigger=trigger,
+         plan=plan,
+-        extra_parsed=extra_parsed,
++        extra_parsed=_emit_parsed,
+     )
+ 
+-    logger.info(
+-        f"[dedup] trigger={trigger} groups={len(plan.get('groups', []))} "
+-        f"shadowed={len(delete_ids)} (apply={delete_from_store})"
+-    )
++    if apply_stats["apply_mode"] == "shadow":
++        _lvl = logger.info if apply_stats["applied"] is True else logger.warning
++        _lvl(
++            f"[dedup] trigger={trigger} groups={len(plan.get('groups', []))} "
++            f"planned={apply_stats['planned']} "
++            f"confirmed_hidden={apply_stats['confirmed']} "
++            f"failed={apply_stats['failed']} "
++            f"applied={apply_stats['applied']}"
++        )
++    else:
++        logger.info(
++            f"[dedup] trigger={trigger} groups={len(plan.get('groups', []))} "
++            f"planned_drop={apply_stats['planned']} "
++            f"applied={apply_stats['applied']} "
++            f"(no store write: {apply_stats['apply_mode']})"
++        )
+     return plan

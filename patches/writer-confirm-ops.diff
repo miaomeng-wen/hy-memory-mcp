@@ -1,0 +1,435 @@
+# Upstream source: Tencent-Hunyuan/Hy-Memory, hy-memory 2.0.3
+# Upstream copyright: Copyright (C) 2026 Tencent. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by the hy-memory-mcp project; these are local modifications.
+# Modification details are documented below and in NOTICE.
+# Upstream license copy: third_party/HY-MEMORY-LICENSE
+
+# T001: writer: ADD/UPDATE/SUPERSEDE 落地对账、partial 暴露、无效抽取不隐藏 L1
+# 基线 = pip 原版 + apply_patches.py 的片段补丁（顺序不能变）
+# sha256-before: 71b99c5a3f25c2f14696cec8e12c2942a1c3ed1c7b55734ba57e1fbd9631ce9e
+# sha256-after:  4997e8e72aa2ef740b267d8415410cb30c4905e561518425360ffb29e59b474b
+--- a/pipelines/writer.py
++++ b/pipelines/writer.py
+@@ -348,6 +348,37 @@
+             logger.debug(f"[entity-index] skipped (non-fatal): {e}")
+ 
+     @staticmethod
++    def _reject_malformed_items(extracted_info: Dict[str, Any]) -> str:
++        """拒绝形状不合 schema 的抽取项，返回空串表示可接受。
++
++        extractor 已做结构校验，这里是落地前的第二道闸：即便上游改了校验，
++        ``{"memory": "two facts"}`` 这类值也不能被静默当成"无事实"清空，
++        ``memory`` 里混进字符串/缺 content 的项也不能被静默跳过。
++        """
++        if not isinstance(extracted_info, dict):
++            return f"extracted_info is {type(extracted_info).__name__}"
++        for key in ("memory", "facts", "identity", "intentions"):
++            if key not in extracted_info:
++                continue
++            items = extracted_info.get(key)
++            if items is None:
++                continue
++            if not isinstance(items, list):
++                return f"{key} must be a list, got {type(items).__name__}"
++            for idx, item in enumerate(items):
++                if not isinstance(item, dict):
++                    return f"{key}[{idx}] must be an object, got {type(item).__name__}"
++                if not str(item.get("content") or "").strip():
++                    return f"{key}[{idx}] has no content"
++        for key in ("basic_info", "profile"):
++            if key not in extracted_info:
++                continue
++            value = extracted_info.get(key)
++            if value is not None and not isinstance(value, dict):
++                return f"{key} must be an object, got {type(value).__name__}"
++        return ""
++
++    @staticmethod
+     def _collect_new_memories(
+         extracted_info: Dict[str, Any],
+     ) -> Tuple[List[str], List[Dict]]:
+@@ -363,6 +394,12 @@
+         """
+         new_memory_texts: List[str] = []
+         new_memories_meta: List[Dict] = []
++
++        # 结构不合格（如 memory 是字符串）不能当成"没有事实"：这里直接抛错，
++        # 由 _run_agent 的失败路径把原始 L1 保留为 ACTIVE 并让调用方看到失败。
++        _malformed = MemoryWriter._reject_malformed_items(extracted_info or {})
++        if _malformed:
++            raise ValueError(f"malformed extracted_info: {_malformed}")
+ 
+         # 1) memory → 每条独立 memory（统一 L2_FACT）
+         #    新版 extractor 输出 `memory`；兼容旧版 `facts` 字段。
+@@ -1349,6 +1386,20 @@
+         add_cnt = 0           # ADD（全新）
+         supersede_cnt = 0     # SUPERSEDE（矛盾演化）
+         update_cnt = 0        # UPDATE（合并精炼）
++
++        def _record_unconfirmed(target_id: str, reason: str) -> None:
++            unconfirmed_op_ids.append(str(target_id or ""))
++            unconfirmed_op_reasons.append(reason)
++        # 计划执行账本：reconciler 计划了哪些 op、真正落地的是哪几类。
++        # 以往只统计成功数，零落地（批量接口返回空 id）和部分落地都会伪装成
++        # 完整成功；现在每个 op 要么进 confirmed_*，要么进 unconfirmed_op_ids。
++        planned_op_count = len(recon_result.ops)
++        confirmed_ops = 0     # 产生了真实存储效果（新增/更新/隐藏）的 op 数
++        confirmed_add_ids: List[str] = []          # 新增节点（ADD / SUPERSEDE 新 head）
++        confirmed_update_ids: List[str] = []       # 原地 UPDATE 生效的节点
++        confirmed_shadow_ids: List[str] = []       # 已确认被隐藏/失效的旧节点
++        unconfirmed_op_ids: List[str] = []         # 未能确认落地的目标 id（含未知）
++        unconfirmed_op_reasons: List[str] = []     # 与上面对齐的原因码
+ 
+         # A fresh-user reconcile commonly produces an ADD-only batch (PMV2
+         # chunks often contain 7-15 facts).  Every vector-store backend already
+@@ -1470,8 +1521,12 @@
+                         "[reconciler] UPDATE batch did not return node id %s",
+                         node.node_id,
+                     )
++                    # 批量接口没有回执 = 生效情况未知，不能计入已落地。
++                    _record_unconfirmed(node.node_id, "batch_update_no_receipt")
+                     continue
+                 stored_ids.append(node.node_id)
++                confirmed_update_ids.append(node.node_id)
++                confirmed_ops += 1
+                 graph_payload.append((node, op))
+                 update_cnt += 1
+                 await self._emit_reconcile_apply(
+@@ -1550,8 +1605,12 @@
+                         "[reconciler] ADD batch did not return node id %s",
+                         node.node_id,
+                     )
++                    # 批量接口没有回执 = 生效情况未知；不能让调用方以为已经写入。
++                    _record_unconfirmed(node.node_id, "batch_add_no_receipt")
+                     continue
+                 stored_ids.append(node.node_id)
++                confirmed_add_ids.append(node.node_id)
++                confirmed_ops += 1
+                 graph_payload.append((node, op))
+                 add_cnt += 1
+                 await self._emit_reconcile_apply(
+@@ -1601,23 +1660,37 @@
+                 # UPDATE with no content = legacy DELETE mapping (shadow-only)
+                 if op.op == "UPDATE" and not op.content:
+                     try:
+-                        await vector_store.update_payload(
++                        # update_payload 契约返回 bool：Qdrant/Chroma 吞异常后
++                        # return False，Faiss 找不到点也返回 False。不判返回值
++                        # 会把"没抛异常"当成"已隐藏"，与 DEDUP 同一类静默失败。
++                        _shadow_ok = await vector_store.update_payload(
+                             target_id,
+                             {
+                                 "is_latest": False,
+                                 "status": MemoryStatus.SHADOW.value,
+                             },
+                         )
+-                        try:
+-                            await vector_store.delete_retrieval_clauses(target_id)
+-                        except Exception as clause_error:
+-                            logger.debug(
+-                                "[retrieval-clause] shadow cleanup failed for %s: %s",
+-                                target_id, clause_error,
+-                            )
+-                        logger.debug(f"[reconciler] shadow-only UPDATE: memory_id={target_id}")
+                     except Exception as e:
+                         logger.warning(f"[reconciler] failed to shadow node {target_id}: {e}")
++                        _record_unconfirmed(target_id, "shadow_update_failed")
++                        continue
++                    if _shadow_ok is False:
++                        logger.warning(
++                            f"[reconciler] shadow-only UPDATE not confirmed for "
++                            f"{target_id}: update_payload returned False"
++                        )
++                        _record_unconfirmed(target_id, "shadow_update_not_confirmed")
++                        continue
++                    try:
++                        await vector_store.delete_retrieval_clauses(target_id)
++                    except Exception as clause_error:
++                        logger.debug(
++                            "[retrieval-clause] shadow cleanup failed for %s: %s",
++                            target_id, clause_error,
++                        )
++                    logger.debug(f"[reconciler] shadow-only UPDATE: memory_id={target_id}")
++                    confirmed_shadow_ids.append(target_id)
++                    confirmed_ops += 1
+                     continue
+ 
+                 content = op.content or ""
+@@ -1801,8 +1874,11 @@
+                         await vector_store.update_payload(target_id, _updates)
+                     except Exception as e:
+                         logger.warning(f"[reconciler] in-place UPDATE failed on {target_id}: {e}")
++                        _record_unconfirmed(target_id, "inplace_update_failed")
+                         continue
+                     stored_ids.append(target_id)
++                    confirmed_update_ids.append(target_id)
++                    confirmed_ops += 1
+                     graph_payload.append((
+                         self._graph_stub_node(
+                             target_id, content, layer, list(op.tags or []), request,
+@@ -1845,14 +1921,31 @@
+                 # ------------------------------------------------
+                 # SUPERSEDE：shadow（SUPERSEDED）旧节点 + 建新链头节点
+                 # ------------------------------------------------
++                _old_marked = None
+                 try:
+-                    await vector_store.update_payload(
++                    _old_marked = await vector_store.update_payload(
+                         target_id,
+                         {
+                             "is_latest": False,
+                             "status": old_status,
+                         },
+                     )
++                except Exception as e:
++                    logger.warning(f"[reconciler] failed to mark old node {target_id} ({op.op}): {e}")
++                    _record_unconfirmed(target_id, f"{op.op.lower()}_old_node_failed")
++                    continue
++                if _old_marked is False:
++                    # 旧节点没被降级 → 旧+新会同时 ACTIVE（双活）。新内容仍然要写
++                    # （丢掉新事实更糟），但这个 op 只能算"部分生效"，必须记账，
++                    # 否则上层会把整批当成功。也跳过 retrieval-clause 清理，避免
++                    # 在旧节点状态未变的情况下先删索引。
++                    logger.warning(
++                        f"[reconciler] {op.op} old node {target_id} not confirmed "
++                        f"(update_payload returned False); new head will still be written"
++                    )
++                    _record_unconfirmed(target_id, f"{op.op.lower()}_old_node_not_confirmed")
++                    _old_marked = False
++                else:
+                     try:
+                         await vector_store.delete_retrieval_clauses(target_id)
+                     except Exception as clause_error:
+@@ -1860,9 +1953,6 @@
+                             "[retrieval-clause] supersede cleanup failed for %s: %s",
+                             target_id, clause_error,
+                         )
+-                except Exception as e:
+-                    logger.warning(f"[reconciler] failed to mark old node {target_id} ({op.op}): {e}")
+-                    continue
+ 
+                 # 创建新 head 节点（此处只可能是 SUPERSEDE；UPDATE 已在上面原地更新并 continue）
+                 new_node = MemoryNode(
+@@ -1892,6 +1982,24 @@
+                 )
+                 nid = await vector_store.upsert(new_node)
+                 stored_ids.append(nid)
++                confirmed_add_ids.append(nid)
++                if _old_marked is False:
++                    # 旧节点降级未确认：新 head 已写入（新事实不丢），但这个 op
++                    # 只完成了一半。已在上面 _record_unconfirmed，此处不累加
++                    # confirmed_ops，让 planned > confirmed 如实暴露 partial。
++                    graph_payload.append((new_node, op))
++                    await self._emit_reconcile_apply(
++                        request, vector_store=vector_store, op_type="SUPERSEDE",
++                        memory_id=nid, layer=layer.value, content=content,
++                        supersedes=[target_id],
++                    )
++                    await self._maybe_index_entities(vector_store, new_node, request)
++                    supersede_cnt += 1
++                    tags_to_index.update(t for t in (new_node.tags or []) if t)
++                    continue
++                if target_id:
++                    confirmed_shadow_ids.append(target_id)
++                confirmed_ops += 1
+                 graph_payload.append((new_node, op))
+                 if target_id:
+                     superseded_old_ids.append(target_id)
+@@ -1947,6 +2055,7 @@
+             # ------------------------------------------------
+             if op.op != "ADD":
+                 logger.warning(f"[reconciler] unknown op '{op.op}', skipped")
++                _record_unconfirmed(getattr(op, "memory_id", "") or "", "unknown_op")
+                 continue
+ 
+             content = op.content or ""
+@@ -1975,6 +2084,8 @@
+             )
+             nid = await vector_store.upsert(new_node)
+             stored_ids.append(nid)
++            confirmed_add_ids.append(nid)
++            confirmed_ops += 1
+             graph_payload.append((new_node, op))
+             add_cnt += 1
+             await self._emit_reconcile_apply(
+@@ -2084,17 +2195,52 @@
+             request=request,
+         )
+ 
++        recon_tokens = {
++            "prompt": recon_result.prompt_tokens,
++            "completion": recon_result.completion_tokens,
++            "total": recon_result.total_tokens,
++        }
+         ops_counts = {
+             "add": add_cnt,
+             "supersede": supersede_cnt,
+             "update": update_cnt,
+             "total": add_cnt + supersede_cnt + update_cnt,
++            # ── 计划 vs 实际确认（调用方据此区分"已确认写入 / 部分生效 / 未知"）──
++            "planned": planned_op_count,
++            "confirmed": confirmed_ops,
++            # unconfirmed 含「明确失败」与「无回执所以生效未知」两类，按 id 暴露，
++            # 由调用方决定重试粒度；这里不做整批重试，因为部分 op 可能已经生效。
++            "unconfirmed": len(unconfirmed_op_ids),
++            "unconfirmed_ids": list(unconfirmed_op_ids),
++            "unconfirmed_reasons": list(unconfirmed_op_reasons),
++            "confirmed_add_ids": list(confirmed_add_ids),
++            "confirmed_update_ids": list(confirmed_update_ids),
++            "confirmed_shadow_ids": list(confirmed_shadow_ids),
+         }
+-        recon_tokens = {
+-            "prompt": recon_result.prompt_tokens,
+-            "completion": recon_result.completion_tokens,
+-            "total": recon_result.total_tokens,
+-        }
++        _not_applied = planned_op_count > 0 and confirmed_ops < planned_op_count
++        if _not_applied:
++            _outcome = "none" if confirmed_ops == 0 else "partial"
++            logger.warning(
++                "[reconciler] ops not fully confirmed req=%s planned=%d confirmed=%d "
++                "unconfirmed=%d reasons=%s",
++                req_id, planned_op_count, confirmed_ops,
++                len(unconfirmed_op_ids), sorted(set(unconfirmed_op_reasons)),
++            )
++            ops_counts["applied"] = _outcome
++            # 没有任何 op 落地、而计划里确实有 op：这不是"合法的空操作"，而是写入
++            # 未生效。返回 error 让上层走失败路径（保留 L1、让调用方看到未写入）；
++            # 已有的条目不会被回滚，且调用方据 unconfirmed_ids 决定重试范围。
++            if confirmed_ops == 0:
++                return (
++                    stored_ids,
++                    "reconcile planned "
++                    f"{planned_op_count} op(s) but none was confirmed "
++                    f"(reasons: {sorted(set(unconfirmed_op_reasons)) or ['unknown']})",
++                    ops_counts,
++                    recon_tokens,
++                )
++        else:
++            ops_counts["applied"] = "all"
+         return stored_ids, None, ops_counts, recon_tokens
+ 
+     async def _direct_store(
+@@ -2421,13 +2567,34 @@
+             raw_contents = request.extra.get("extracted_contents")
+             if not raw_contents:
+                 raw_contents = [request.content] if request.content else []
++            if isinstance(raw_contents, str):
++                raw_contents = [raw_contents]
++            elif not isinstance(raw_contents, (list, tuple)):
++                response.success = False
++                response.error_code = 400
++                response.error_message = (
++                    "extracted_contents must be a list of strings, got "
++                    f"{type(raw_contents).__name__}"
++                )
++                return response
++            _dropped = [c for c in raw_contents if not (isinstance(c, str) and c.strip())]
+             contents = [c.strip() for c in raw_contents if isinstance(c, str) and c.strip()]
+ 
+             if not contents:
++                response.success = False
+                 response.error_code = 400
+                 response.error_message = "extracted_contents or content is required"
+                 return response
++            if _dropped:
++                # 送进来 N 条，实际只有 M 条可写：调用方必须知道其余的被丢弃，
++                # 否则会以为自己提交的全部已写入。
++                response.extra["dropped_contents"] = len(_dropped)
++                logger.warning(
++                    "[write_extracted] dropped %d non-text/blank entr(ies) of %d",
++                    len(_dropped), len(raw_contents),
++                )
+             if not request.user_id:
++                response.success = False
+                 response.error_code = 400
+                 response.error_message = "user_id is required"
+                 return response
+@@ -2488,17 +2655,47 @@
+                 response.error_message = f"[RECONCILE_FAILED] {recon_error}"
+                 response.extra["agent_status"] = "failed"
+                 response.extra["agent_error"] = recon_error
+-                response.extra["agent_nodes"] = 0
++                # 部分 op 可能已经落地：如实暴露已确认 id，不能一律写成 0。
++                response.extra["agent_stored_ids"] = stored_ids
++                response.extra["agent_nodes"] = len(stored_ids)
+                 return response
+ 
++            _planned = int(ops_counts.get("planned") or 0)
++            _confirmed = int(ops_counts.get("confirmed") or 0)
++            _applied = ops_counts.get("applied") or "all"
++            response.layer = MemoryLayer.L2_FACT.value
++            response.extra["agent_stored_ids"] = stored_ids
++            response.extra["agent_nodes"] = len(stored_ids)
++            response.extra["agent_mode"] = "extracted"
++
++            if _applied == "partial":
++                # 部分生效：success=False 是给调用方看的"不要整批重放"信号——
++                # request_id 不是幂等键，整批重试会重复写入已落地的条目。
++                # 需要重试的只有 ops_counts["unconfirmed_ids"]。
++                response.success = False
++                response.error_code = 409
++                response.error_message = (
++                    "[PARTIAL_PERSIST] "
++                    f"{_confirmed}/{_planned} planned op(s) confirmed; "
++                    f"{int(ops_counts.get('unconfirmed') or 0)} unconfirmed "
++                    f"(ids: {ops_counts.get('unconfirmed_ids')}); "
++                    "retry only the unconfirmed ops"
++                )
++                response.memory_id = ""
++                response.extra["agent_status"] = "partial"
++                response.extra["agent_error"] = response.error_message
++                response.extra["partial_persist"] = True
++                response.elapsed_ms = (datetime.now() - start_time).total_seconds() * 1000
++                logger.warning(
++                    "[write_extracted] partial persist: %s", response.error_message,
++                )
++                return response
++
+             response.success = True
+-            response.layer = MemoryLayer.L2_FACT.value
+             response.memory_id = stored_ids[0] if stored_ids else ""
+-            response.extra["agent_stored_ids"] = stored_ids
+             response.extra["agent_status"] = "success"
+             response.extra["agent_error"] = ""
+             response.extra["agent_nodes"] = len(stored_ids)
+-            response.extra["agent_mode"] = "extracted"
+             response.elapsed_ms = (datetime.now() - start_time).total_seconds() * 1000
+             logger.info(
+                 f"[write_extracted] done: {len(stored_ids)} nodes stored from "
+@@ -3508,9 +3705,33 @@
+                 )
+ 
+             response.extra["agent_stored_ids"] = stored_ids
+-            response.extra["agent_status"] = "success"
++            _planned_ops = int((response.extra.get("reconcile_ops") or {}).get("planned") or 0)
++            _confirmed_ops = int((response.extra.get("reconcile_ops") or {}).get("confirmed") or 0)
++            _partial_ops = _planned_ops > _confirmed_ops
++            response.extra["agent_status"] = (
++                "success" if not _partial_ops and stored_ids else
++                "partial" if stored_ids else "noop"
++            )
+             response.extra["agent_error"] = ""
+             response.extra["agent_nodes"] = len(stored_ids)
++            if _partial_ops:
++                # 部分 op 未确认：保留 L1（不隐藏原文），并让调用方看到未确认项，
++                # 由它决定是否只补写 unconfirmed_ids——不做整批重放。
++                _ops = response.extra.get("reconcile_ops") or {}
++                response.success = False
++                response.error_code = 409
++                response.error_message = (
++                    "[PARTIAL_PERSIST] "
++                    f"{_confirmed_ops}/{_planned_ops} planned op(s) confirmed; "
++                    f"unconfirmed ids: {_ops.get('unconfirmed_ids')}; "
++                    "only those ops need retrying"
++                )
++                response.extra["agent_status"] = "partial"
++                response.extra["agent_error"] = response.error_message
++                response.extra["partial_persist"] = True
++                _vs_logger.setLevel(_vs_level)
++                logger.warning("[agent] %s", response.error_message)
++                return
+             _vs_logger.setLevel(_vs_level)
+             logger.info(
+                 f"TRACE_PERF [{_perf_req_id}] S1_PERSIST_DONE "

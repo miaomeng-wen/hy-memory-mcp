@@ -1,0 +1,16 @@
+hy-memory-mcp
+An independently maintained Windows MCP service built on Hy-Memory.
+This project is not an official Tencent product.
+
+Hy-Memory upstream: https://github.com/Tencent-Hunyuan/Hy-Memory
+Source SDK version: hy-memory 2.0.3
+Copyright (C) 2026 Tencent. All rights reserved.
+Upstream license: Apache-2.0; see third_party/HY-MEMORY-LICENSE.
+
+apply_patches.py contains upstream source fragments. patches/*.diff contains
+upstream source context and modifications to agent/extractor.py,
+agent/reconciler.py, pipelines/writer.py and pipelines/_retrieval/dedup.py.
+Local modifications add response/schema validation, token budget adjustments,
+confirmed-write accounting, and deduplication consistency checks. The diff
+files identify changed lines; apply_patches.py documents the modifications.
+These notices do not replace any applicable upstream copyright notices.
