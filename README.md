@@ -70,6 +70,41 @@ memory_search(query="项目约定", user_id="default", limit=5,
 `ok=true, count=0` 表示无匹配；`ok=false` 表示失败，需要检查 `error_kind`。
 `memory_add(mode="facts")` 跳过事实抽取，但在 pro 模式下协调写入仍可能调用 LLM。
 
+### Cursor
+
+先启动记忆服务，再编辑全局配置 `~/.cursor/mcp.json`
+（Windows：`%USERPROFILE%\.cursor\mcp.json`），将上面 JSON 示例中的 `memory`
+条目合并到现有 `mcpServers`，保留其他服务器配置。
+该配置供所有项目使用；修改后打开或重新加载 Cursor，确认 `memory` 已连接并发现六个工具。
+服务需要保持运行，Cursor 直接通过 Streamable HTTP 连接，无需再启动一份记忆服务。
+
+要让当前项目中的 Agent 按规则调用记忆，在该项目创建 `.cursor/rules/hy-memory.mdc`，
+先写入以下 frontmatter，再在其后粘贴 [MEMORY_RULES.md](client_rules/MEMORY_RULES.md) 的完整内容：
+
+```mdc
+---
+description: Hy-Memory shared long-term memory
+alwaysApply: true
+---
+```
+
+将规则中的 `user_id="default"` 改为与自己的 `MEMORY_DEFAULT_USER_ID` 一致；
+从 Cursor 写入时使用 `source="cursor"` 并带上 `session_id`。
+项目规则仅在对应项目生效；其他项目需要各自添加，也可将规则正文加入 Cursor 的 User Rules。
+MCP 配置和记忆调用规则分别决定工具是否可用、Agent 何时调用工具。
+
+可在 Agent 中输入：「调用 memory_search 查询项目约定，user_id 使用我配置的用户，
+layers 使用 l1_raw、l2_fact、l3_summary、l4_identity。」
+按需批准 Cursor 提示的工具调用，并确认返回 `ok=true`；`count=0` 也表示请求成功。
+
+2026-10-22 在 Windows 的 Cursor 3.26.16 上已验证连接成功，工具快照显示
+`connected`、`toolCount=6`，且六个工具描述均已生成；独立 HTTP 客户端运行
+`test_mcp.py --no-write` 全部通过，包含深度检索检查。本次未通过 Cursor 对话验证写入。
+**Cursor 可以调用共享记忆，但 Cursor 历史聊天尚未纳入自动导入**；
+当前历史导入仍只覆盖 Codex、DeepSeek Harness、ZCode。
+
+参考：[Cursor MCP 文档](https://cursor.com/docs/mcp)、[Cursor Rules 文档](https://cursor.com/docs/rules)。
+
 ## 历史导入与自动启动
 
 历史导入会读取当前用户的客户端会话。先确认需要导入哪些来源，再手动触发或安装计划任务。

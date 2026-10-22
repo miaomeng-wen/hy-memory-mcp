@@ -48,4 +48,4 @@ memory_search(query="...", user_id="default", limit=5,
 ## 边界
 
 - 记忆服务不可用（`memory_health` 失败）时**不要阻塞主任务**，正常交付并一句话说明即可。
-- 历史会话由后台计划任务 `HyMemoryImport` 每 5 分钟增量导入（零 LLM），不需要你手工回填。
+- 安装并启用后台计划任务 `HyMemoryImport` 后，Codex / DeepSeek Harness / ZCode 历史会话每 5 分钟增量导入（零 LLM），不需要手工回填；当前不包含 Cursor 历史会话。
